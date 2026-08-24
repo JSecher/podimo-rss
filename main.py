@@ -32,7 +32,7 @@ from hypercorn.config import Config
 from hypercorn.asyncio import serve
 from urllib.parse import quote
 from podimo.config import *
-from podimo.utils import generateHeaders, randomHexId
+from podimo.utils import generateHeaders, randomHexId, set_itunes_image
 import podimo.cache as cache
 import cloudscraper
 import traceback
@@ -302,7 +302,7 @@ async def addFeedEntry(fg, episode, session, locale):
     fe.title(episode["title"])
     fe.description(episode["description"])
     fe.pubDate(episode.get("publishDatetime", episode.get("datetime")))
-    fe.podcast.itunes_image(episode["imageUrl"])
+    set_itunes_image(fe.podcast, episode["imageUrl"])
 
     url, duration = extract_audio_url(episode)
     if url is None:
