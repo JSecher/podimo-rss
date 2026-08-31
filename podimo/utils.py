@@ -20,6 +20,7 @@
 from email.utils import parseaddr
 from random import choice, randint
 from hashlib import sha256
+from urllib.parse import urlparse
 import asyncio
 from functools import wraps, partial
 
@@ -71,6 +72,17 @@ def set_itunes_image(extension, url):
     except ValueError:
         mangled_attr = f"_{type(extension).__name__}__itunes_image"
         setattr(extension, mangled_attr, url)
+
+
+# Some Podimo episodes resolve to an HLS manifest instead of a direct audio
+# file. Podcast apps that fetch the enclosure and pipe it straight into
+# ffmpeg (e.g. AudiobookShelf) can't auto-detect HLS from a raw byte stream
+# with no extension/mime hint, so those downloads fail. Query strings (e.g.
+# signed-URL auth params) are stripped before checking the extension.
+def is_hls_url(url):
+    if not url:
+        return False
+    return urlparse(url).path.lower().endswith(".m3u8")
 
 
 def async_wrap(func):

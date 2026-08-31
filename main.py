@@ -26,13 +26,13 @@ from podimo.client import PodimoClient
 from feedgen.feed import FeedGenerator
 from mimetypes import guess_type
 from aiohttp import ClientSession, CookieJar, ClientTimeout
-from quart import Quart, Response, render_template, request
+from quart import Quart, Response, render_template, request, redirect
 from hashlib import sha256
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
 from urllib.parse import quote
 from podimo.config import *
-from podimo.utils import generateHeaders, randomHexId, set_itunes_image
+from podimo.utils import generateHeaders, randomHexId, set_itunes_image, is_hls_url
 import podimo.cache as cache
 import cloudscraper
 import traceback
@@ -230,7 +230,8 @@ async def serve_feed(username, password, podcast_id, region, locale):
         # Get a list of valid podcasts
         try:
             podcasts = await podcastsToRss(
-                podcast_id, await client.getPodcasts(podcast_id, scraper), locale
+                podcast_id, await client.getPodcasts(podcast_id, scraper), locale,
+                username, password, region
             )
         except Exception as e:
             exception = str(e)
@@ -241,6 +242,105 @@ async def serve_feed(username, password, podcast_id, region, locale):
             logging.error(f"Error while fetching podcasts: {exception}")
             return Response("Something went wrong while fetching the podcasts", 500, {})
         return Response(podcasts, mimetype="text/xml")
+
+
+@app.route("/audio/<string:podcast_id>/<string:episode_id>.mp3")
+async def serve_basic_auth_audio(podcast_id, episode_id):
+    if LOCAL_CREDENTIALS:
+        args = request.args
+        region = args.get("region")
+        locale = args.get("locale")
+        return await serve_audio(PODIMO_EMAIL, PODIMO_PASSWORD, podcast_id, episode_id, region, locale)
+    else:
+        auth = request.authorization
+        if not auth:
+            return authenticate()
+        else:
+            username, region, locale = split_username_region_locale(auth.username)
+            return await serve_audio(username, auth.password, podcast_id, episode_id, region, locale)
+
+
+@app.route("/audio/<string:username>/<string:password>/<string:podcast_id>/<string:episode_id>.mp3")
+async def serve_audio(username, password, podcast_id, episode_id, region=None, locale=None):
+    if region is None:
+        region = request.args.get("region")
+    if locale is None:
+        locale = request.args.get("locale")
+
+    if podcast_id_pattern.fullmatch(podcast_id) is None:
+        return Response("Invalid podcast id format", 400, {})
+    if region not in [region_code for (region_code, _) in REGIONS]:
+        return Response("Invalid region", 400, {})
+    if locale not in LOCALES:
+        return Response("Invalid locale", 400, {})
+    if any(item in request.url for item in BLOCKED):
+        return Response("Podcast is gone", 410, {})
+
+    with cloudscraper.create_scraper() as scraper:
+        scraper.proxies = proxies
+        client = await check_auth(username, password, region, locale, scraper)
+        if not client:
+            return authenticate()
+
+        try:
+            data = await client.getPodcasts(podcast_id, scraper)
+        except Exception as e:
+            logging.error(f"Error while fetching podcast for audio proxy: {e}")
+            return Response("Something went wrong while fetching the podcast", 500, {})
+
+        episode = next((e for e in data["episodes"] if e["id"] == episode_id), None)
+        if episode is None:
+            return Response("Episode not found", 404, {})
+
+        url, _ = extract_audio_url(episode)
+        if url is None:
+            return Response("No audio available for this episode", 404, {})
+
+        if not is_hls_url(url):
+            # Shouldn't normally happen since we only ever point enclosures
+            # here for HLS episodes, but handle it gracefully regardless.
+            return redirect(url)
+
+        logging.info(f"Transcoding HLS episode '{episode['title']}' ({episode_id}) for podcast {podcast_id}")
+        body = stream_hls_episode_as_mp3(url, locale)
+        return Response(body, mimetype="audio/mpeg")
+
+
+async def stream_hls_episode_as_mp3(url, locale):
+    user_agent = generateHeaders(None, locale)["user-agent"]
+    command = [
+        FFMPEG_PATH,
+        "-loglevel", "error",
+        "-user_agent", user_agent,
+        "-i", url,
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "128k",
+        "-f", "mp3",
+        "pipe:1",
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        while True:
+            chunk = await process.stdout.read(65536)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        if process.returncode is None:
+            process.kill()
+        stderr = await process.stderr.read()
+        await process.wait()
+        if process.returncode not in (0, None, -9):
+            logging.error(
+                f"ffmpeg failed to transcode HLS episode ({url}): "
+                f"{stderr.decode(errors='replace')[:2000]}"
+            )
 
 
 async def urlHeadInfo(session, id, url, locale):
@@ -289,14 +389,33 @@ def extract_audio_url(episode):
         if episode["streamMedia"]:
             url = episode["streamMedia"]["url"]
             duration = episode["streamMedia"]["duration"]
-            if "hls-media" in url and "/main.m3u8" in url:
-                url = url.replace("hls-media", "audios")
-                url = url.replace("/main.m3u8", ".mp3")
+
+    if url and is_hls_url(url):
+        # Some older Podimo CDN URLs expose a direct MP3 next to the HLS
+        # manifest via this string substitution. Newer episodes (signed
+        # media-cdn-episodes.podimo.com manifests) don't match this pattern,
+        # so it's best-effort; addFeedEntry proxies/transcodes the HLS
+        # stream itself when it doesn't apply.
+        direct = url.replace("hls-media", "audios").replace("/main.m3u8", ".mp3")
+        if direct != url and not is_hls_url(direct):
+            url = direct
 
     return url, duration
 
 
-async def addFeedEntry(fg, episode, session, locale):
+def build_audio_proxy_url(podcast_id, episode_id, username, password, region, locale):
+    episode_id = quote(str(episode_id), safe="")
+    region = quote(str(region), safe="")
+    locale = quote(str(locale), safe="")
+    path = f"/audio/{podcast_id}/{episode_id}.mp3?region={region}&locale={locale}"
+    if LOCAL_CREDENTIALS:
+        return f"{PODIMO_PROTOCOL}://{PODIMO_HOSTNAME}{path}"
+    username = quote(str(username), safe="")
+    password = quote(str(password), safe="")
+    return f"{PODIMO_PROTOCOL}://{username}:{password}@{PODIMO_HOSTNAME}{path}"
+
+
+async def addFeedEntry(fg, episode, session, locale, podcast_id, username, password, region):
     fe = fg.add_entry()
     fe.guid(episode["id"])
     fe.title(episode["title"])
@@ -306,9 +425,21 @@ async def addFeedEntry(fg, episode, session, locale):
 
     url, duration = extract_audio_url(episode)
     if url is None:
-        return 
+        return
     logging.debug(f"Found podcast '{episode['title']}'")
     fe.podcast.itunes_duration(duration)
+
+    if is_hls_url(url):
+        # Podcast apps (e.g. AudiobookShelf) fetch the enclosure and pipe it
+        # straight into ffmpeg with no extension/mime hint, which can't
+        # auto-detect an HLS manifest from a raw byte stream and fails with
+        # "Invalid data found when processing input". Point the enclosure at
+        # our own proxy, which resolves and transcodes the HLS stream into a
+        # plain MP3 on the fly instead.
+        enclosure_url = build_audio_proxy_url(podcast_id, episode["id"], username, password, region, locale)
+        fe.enclosure(enclosure_url, 0, "audio/mpeg")
+        return
+
     content_length, content_type = await urlHeadInfo(session, episode['id'], url, locale)
     fe.enclosure(url, content_length, content_type)
 
@@ -316,7 +447,7 @@ def chunks(x, n):
     for i in range(0, len(x), n):
         yield x[i:i + n]
 
-async def podcastsToRss(podcast_id, data, locale):
+async def podcastsToRss(podcast_id, data, locale, username, password, region):
     fg = FeedGenerator()
     fg.load_extension("podcast")
 
@@ -358,7 +489,7 @@ async def podcastsToRss(podcast_id, data, locale):
     async with ClientSession() as session:
         for chunk in chunks(episodes, 5):
             await asyncio.gather(
-                *[addFeedEntry(fg, episode, session, locale) for episode in chunk]
+                *[addFeedEntry(fg, episode, session, locale, podcast_id, username, password, region) for episode in chunk]
             )
 
     feed = fg.rss_str(pretty=True)
