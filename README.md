@@ -8,6 +8,8 @@ This tool allows you to stream Podimo podcasts with your preferred podcast playe
 
 ## Recommended installation for self-hosting
 Make sure you have a recent Python 3 version installed, as this is required for the steps below.
+`ffmpeg` must also be installed and available on `PATH` — it's used to transcode episodes that
+Podimo only serves as an HLS stream into a plain MP3 (already included in the Docker image).
 
 1. Clone this repository and enter the newly created directory
 ```sh

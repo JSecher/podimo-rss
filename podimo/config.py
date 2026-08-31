@@ -44,6 +44,10 @@ SCRAPER_API = config.get("SCRAPER_API", None)
 CACHE_DIR = os.path.abspath(str(config.get("CACHE_DIR", "./cache")))
 BLOCK_LIST_FILE = str(config.get("BLOCK_LIST_FILE", "./.block-list"))
 
+# Path to the ffmpeg binary, used to transcode episodes that Podimo only
+# serves as an HLS stream into a plain MP3 that podcast apps can download.
+FFMPEG_PATH = str(config.get("FFMPEG_PATH", "ffmpeg"))
+
 # Enable extra logging in debugging mode
 DEBUG = bool(str(config.get("DEBUG", None)).lower() in ['true', '1', 't', 'y', 'yes'])
 
