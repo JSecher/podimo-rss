@@ -60,6 +60,19 @@ def generateHeaders(authorization, locale):
         headers["authorization"] = authorization
     return headers
 
+# feedgen's itunes:image validation only accepts URLs ending in ".jpg" or
+# ".png" and raises ValueError otherwise, but Podimo's CDN now serves cover
+# art as WebP (see https://github.com/ThijsRay/podimo/issues/52). Podcast
+# apps render WebP artwork fine in practice, so store the URL directly
+# instead of dropping episode artwork or failing the whole feed.
+def set_itunes_image(extension, url):
+    try:
+        extension.itunes_image(url)
+    except ValueError:
+        mangled_attr = f"_{type(extension).__name__}__itunes_image"
+        setattr(extension, mangled_attr, url)
+
+
 def async_wrap(func):
     @wraps(func)
     async def run(*args, loop=None, executor=None, **kwargs):
