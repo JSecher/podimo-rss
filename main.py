@@ -276,71 +276,160 @@ async def serve_audio(username, password, podcast_id, episode_id, region=None, l
     if any(item in request.url for item in BLOCKED):
         return Response("Podcast is gone", 410, {})
 
-    with cloudscraper.create_scraper() as scraper:
-        scraper.proxies = proxies
-        client = await check_auth(username, password, region, locale, scraper)
-        if not client:
-            return authenticate()
-
-        try:
+    async def resolve_hls_url(force_refresh=False):
+        """Resolve the episode's current audio URL. Uses its own scraper so it
+        also works when called from inside the streaming response body, after
+        this request's own scraper context has already closed."""
+        with cloudscraper.create_scraper() as scraper:
+            scraper.proxies = proxies
+            client = await check_auth(username, password, region, locale, scraper)
+            if not client:
+                raise PermissionError("authentication failed")
+            if force_refresh:
+                cache.podcast_cache.pop(podcast_id, None)
             data = await client.getPodcasts(podcast_id, scraper)
-        except Exception as e:
-            logging.error(f"Error while fetching podcast for audio proxy: {e}")
-            return Response("Something went wrong while fetching the podcast", 500, {})
-
         episode = next((e for e in data["episodes"] if e["id"] == episode_id), None)
         if episode is None:
-            return Response("Episode not found", 404, {})
-
-        url, _ = extract_audio_url(episode)
-        if url is None:
-            return Response("No audio available for this episode", 404, {})
-
-        if not is_hls_url(url):
-            # Shouldn't normally happen since we only ever point enclosures
-            # here for HLS episodes, but handle it gracefully regardless.
-            return redirect(url)
-
-        logging.info(f"Transcoding HLS episode '{episode['title']}' ({episode_id}) for podcast {podcast_id}")
-        body = stream_hls_episode_as_mp3(url, locale)
-        return Response(body, mimetype="audio/mpeg")
-
-
-async def stream_hls_episode_as_mp3(url, locale):
-    user_agent = generateHeaders(None, locale)["user-agent"]
-    command = [
-        FFMPEG_PATH,
-        "-loglevel", "error",
-        "-user_agent", user_agent,
-        "-i", url,
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-b:a", "128k",
-        "-f", "mp3",
-        "pipe:1",
-    ]
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+            raise LookupError("Episode not found")
+        resolved, _ = extract_audio_url(episode)
+        if not resolved:
+            raise LookupError("No audio available for this episode")
+        return resolved, is_hls_url(resolved), episode.get("title") or episode_id
 
     try:
-        while True:
-            chunk = await process.stdout.read(65536)
-            if not chunk:
-                break
-            yield chunk
-    finally:
-        if process.returncode is None:
-            process.kill()
-        stderr = await process.stderr.read()
-        await process.wait()
-        if process.returncode not in (0, None, -9):
-            logging.error(
-                f"ffmpeg failed to transcode HLS episode ({url}): "
-                f"{stderr.decode(errors='replace')[:2000]}"
+        url, hls, title = await resolve_hls_url()
+    except PermissionError:
+        return authenticate()
+    except LookupError as e:
+        return Response(str(e), 404, {})
+    except Exception as e:
+        logging.error(f"Error while fetching podcast for audio proxy: {e}")
+        return Response("Something went wrong while fetching the podcast", 500, {})
+
+    if not hls:
+        # Shouldn't normally happen since we only ever point enclosures
+        # here for HLS episodes, but handle it gracefully regardless.
+        return redirect(url)
+
+    logging.info(f"Transcoding HLS episode '{title}' ({episode_id}) for podcast {podcast_id}")
+    body = stream_hls_episode_as_mp3(url, locale, resolve_hls_url)
+    return Response(body, mimetype="audio/mpeg")
+
+
+async def stream_hls_episode_as_mp3(url, locale, resolve_url=None):
+    """Transcode a (signed) HLS manifest into a plain MP3 byte stream with
+    ffmpeg.
+
+    stderr is drained concurrently so a chatty ffmpeg can't fill the ~64 KiB
+    OS pipe buffer and wedge the transcode (which shows up downstream as a
+    download that hangs forever); ffmpeg is told to reconnect on transient
+    network/5xx errors and to time out a stalled socket read; and a non-zero
+    exit is surfaced (by raising) instead of silently truncating the file.
+    """
+    user_agent = generateHeaders(None, locale)["user-agent"]
+
+    async def start(input_url):
+        command = [FFMPEG_PATH, "-nostdin", "-loglevel", "warning"]
+        if input_url.lower().startswith(("http://", "https://")):
+            command += [
+                "-user_agent", user_agent,
+                # Fail a stalled network read after 30s instead of hanging forever.
+                "-rw_timeout", "30000000",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
+                # Retry 5xx, but let 4xx (e.g. an expired signed URL) fail fast
+                # so the caller can re-resolve and retry with a fresh URL.
+                "-reconnect_on_http_error", "5xx",
+                "-reconnect_delay_max", "30",
+            ]
+        command += [
+            "-i", input_url,
+            "-vn",
+            "-acodec", "libmp3lame",
+            "-b:a", "128k",
+            "-f", "mp3",
+            "pipe:1",
+        ]
+        return await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    async def drain_stderr(process, tail):
+        """Continuously consume ffmpeg's stderr so it can never fill the OS
+        pipe buffer and stall the transcode. Only the most recent output is
+        kept, for diagnostics. Fixed-size reads avoid StreamReader's line
+        length limit."""
+        try:
+            while True:
+                block = await process.stderr.read(4096)
+                if not block:
+                    break
+                tail.append(block)
+                if len(tail) > 64:
+                    del tail[: len(tail) - 64]
+        except Exception:
+            pass
+
+    input_url = url
+    produced_any = False
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        process = await start(input_url)
+        tail = []
+        drainer = asyncio.ensure_future(drain_stderr(process, tail))
+        try:
+            while True:
+                chunk = await process.stdout.read(65536)
+                if not chunk:
+                    break
+                produced_any = True
+                yield chunk
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.wait()
+            drainer.cancel()
+            try:
+                await drainer
+            except BaseException:
+                pass
+
+        rc = process.returncode
+        if rc is None or rc == 0:
+            return
+        if rc < 0:
+            logging.warning(f"ffmpeg (HLS transcode) terminated by signal {-rc}")
+            return
+
+        stderr_tail = b"".join(tail).decode(errors="replace")[-2000:]
+
+        # Only safe to retry from scratch while nothing has been sent to the
+        # client yet - a partially-streamed body can't be restarted.
+        if not produced_any and attempt < max_attempts and resolve_url is not None:
+            logging.warning(
+                f"ffmpeg exited {rc} before producing audio; refreshing the "
+                f"episode URL and retrying. stderr:\n{stderr_tail}"
             )
+            try:
+                fresh_url, fresh_is_hls, _ = await resolve_url(force_refresh=True)
+            except Exception as e:
+                logging.error(f"Could not refresh episode URL: {e}")
+            else:
+                if fresh_url and fresh_is_hls:
+                    input_url = fresh_url
+                    continue
+
+        raise RuntimeError(
+            f"ffmpeg exited with code {rc} while transcoding HLS episode; "
+            f"stderr:\n{stderr_tail}"
+        )
 
 
 async def urlHeadInfo(session, id, url, locale):
