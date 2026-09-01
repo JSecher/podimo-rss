@@ -313,7 +313,14 @@ async def serve_audio(username, password, podcast_id, episode_id, region=None, l
 
     logging.info(f"Transcoding HLS episode '{title}' ({episode_id}) for podcast {podcast_id}")
     body = stream_hls_episode_as_mp3(url, locale, resolve_hls_url)
-    return Response(body, mimetype="audio/mpeg")
+    response = Response(body, mimetype="audio/mpeg")
+    # Quart's RESPONSE_TIMEOUT (default 60s) bounds how long the whole response
+    # body may take to send. A multi-hour episode transcodes/streams for
+    # several minutes, so without this the download is cut off at ~60s and the
+    # client reports "Input stream error: aborted". None = no limit for this
+    # streaming endpoint.
+    response.timeout = None
+    return response
 
 
 async def stream_hls_episode_as_mp3(url, locale, resolve_url=None):
@@ -588,7 +595,13 @@ async def podcastsToRss(podcast_id, data, locale, username, password, region):
 async def spawn_web_server():
     config = Config()
     config.bind = [PODIMO_BIND_HOST]
-    config.read_timeout = 60
+    # NB: do not set config.read_timeout. In Hypercorn it's an inactivity
+    # timeout on *client -> server* reads that runs for the whole connection
+    # lifetime, so it also fires while we're streaming a long response body
+    # the client isn't talking back on. A 60s value here truncated
+    # /audio/<...>.mp3 transcodes of multi-hour episodes at ~60s, which the
+    # downloading app sees as "Input stream error: aborted". Idle keep-alive
+    # connections are still reaped by keep_alive_timeout (default 5s).
     config.graceful_timeout = 5
     config.backlog = 1000
     app.config['TEMPLATES_AUTO_RELOAD'] = True
